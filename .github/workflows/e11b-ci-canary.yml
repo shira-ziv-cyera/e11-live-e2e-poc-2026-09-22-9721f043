@@ -1,0 +1,102 @@
+name: E11-B CI Canary Publish (research PoC)
+
+# E04-analog: CI-driven Bedrock-Claude → local file → PAT PUT → public URL.
+# Runs once via workflow_dispatch. Safe: canary content only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      canary_uuid:
+        description: 'Canary UUID to embed in the generated page'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  ci-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (temp SSO creds)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> "$GITHUB_ENV"
+          # Verify identity (masked in log)
+          aws sts get-caller-identity > /tmp/whoami.json
+          echo "Assumed identity ARN (partial): $(jq -r '.Arn' /tmp/whoami.json | awk -F'/' '{print $NF}')"
+          echo "AWS account: $(jq -r '.Account' /tmp/whoami.json)"
+
+      - name: Invoke Bedrock Claude Sonnet 4.5
+        env:
+          AWS_REGION: us-east-1
+          CANARY: ${{ inputs.canary_uuid }}
+        run: |
+          set -euo pipefail
+          MODEL_ID="global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+          PROMPT_JSON=$(jq -nc --arg canary "$CANARY" '{
+            anthropic_version: "bedrock-2023-05-31",
+            max_tokens: 2048,
+            system: "You are an HTML generator. Output ONLY a minimal complete HTML5 document that displays the canary UUID prominently in a <pre> tag. Wrap in <p> explaining this is a synthetic research canary from an E04-analog CI-driven PoC. No JavaScript.",
+            messages: [{role: "user", content: [{type: "text", text: "The canary UUID is: CANARY-E11B-CI-\($canary)"}]}]
+          }')
+          echo "$PROMPT_JSON" > /tmp/prompt.json
+          echo "Invoking Bedrock model $MODEL_ID in $AWS_REGION"
+          BEDROCK_START=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+          echo "bedrock_start=$BEDROCK_START" >> "$GITHUB_ENV"
+          aws bedrock-runtime invoke-model \
+            --model-id "$MODEL_ID" \
+            --content-type application/json \
+            --accept application/json \
+            --body fileb:///tmp/prompt.json \
+            /tmp/bedrock-response.json
+          BEDROCK_END=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+          echo "bedrock_end=$BEDROCK_END" >> "$GITHUB_ENV"
+          # Extract Claude's text output
+          jq -r '.content[0].text' /tmp/bedrock-response.json > /tmp/claude-raw.html
+          echo "Raw output size: $(wc -c < /tmp/claude-raw.html) bytes, $(wc -l < /tmp/claude-raw.html) lines"
+          # Strip code fence if present
+          sed '1{/^```html$/d;};$ {/^```$/d;}' /tmp/claude-raw.html > /tmp/index.html
+          echo "Final HTML size: $(wc -c < /tmp/index.html) bytes"
+          echo "Canary present: $(grep -c "$CANARY" /tmp/index.html)"
+          # Publish canary to a subdirectory of the same repo (so E11-A canary isn't overwritten)
+          cp /tmp/index.html "e11b-ci-runs/${CANARY}.html"
+          echo "Local file written to e11b-ci-runs/${CANARY}.html"
+
+      - name: Prepare directory + commit + push
+        env:
+          CANARY: ${{ inputs.canary_uuid }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add e11b-ci-runs/
+          git commit -m "E11-B CI-driven Bedrock canary publish [PoC ${CANARY:0:8}]"
+          git push
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "Published commit: $COMMIT_SHA"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_ENV"
+
+      - name: Write step summary
+        env:
+          CANARY: ${{ inputs.canary_uuid }}
+        run: |
+          {
+            echo "# E11-B CI Canary Publish — completed"
+            echo ""
+            echo "- Canary: \`CANARY-E11B-CI-${CANARY}\`"
+            echo "- Bedrock start: \`${bedrock_start}\`"
+            echo "- Bedrock end: \`${bedrock_end}\`"
+            echo "- Published commit: \`${commit_sha}\`"
+            echo "- Public URL: https://raw.githubusercontent.com/${{ github.repository }}/main/e11b-ci-runs/${CANARY}.html"
+          } >> "$GITHUB_STEP_SUMMARY"
